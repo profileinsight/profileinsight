@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "profileinsight"
+version = "0.0.1"
+description = "Find why your GPU job is slow from its profile."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = ["Development Status :: 1 - Planning", "Topic :: System :: Benchmark"]
+
+[project.urls]
+Homepage = "https://github.com/profileinsight/profileinsight"
