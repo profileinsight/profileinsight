@@ -7,17 +7,24 @@ that launch call, then by GPU start time (all kernels of one CUDA graph launch s
 the order of the program, so it repeats exactly from iteration to iteration, while GPU start order varies with the
 timing of concurrent streams. For every operation the timeline also keeps the CPU calls (CALL_CATEGORIES events on the
 launching thread) that enclosed its launch, outermost first, up to CALL_DEPTH levels: where these change, the program
-moves from one unit of work to the next. All analyses in this package read the timeline as a sequence of symbols: each
+moves from one unit of work to the next; it also keeps the launch call itself and the innermost CPU calls around it (the
+call site). The host's synchronizing calls (SYNC_CALLS: stream, device and event synchronize, synchronous copies) are
+kept with their call sites, because a synchronize empties the GPU's queue of work. All analyses in this package read the timeline as a sequence of symbols: each
 operation is replaced by the index of its name, so that repeated work becomes repeated symbols. Each operation also
 has a family: its name with every run of digits replaced by "#", so that kernels that differ only in a number (a
 recompiled triton_poi_fused__to_copy_21 and _3, tile sizes in template arguments) count as the same kind of work when
 repetitions are compared.
 
 Public components
-    GPU_CATEGORIES, LAUNCH_CATEGORIES, CALL_CATEGORIES, CALL_DEPTH
+    GPU_CATEGORIES, LAUNCH_CATEGORIES, CALL_CATEGORIES, CALL_DEPTH, SITE_DEPTH, SYNC_CALLS
         The trace event categories of GPU operations, of the host calls that launch them and of the CPU calls that
-        enclose launches; the number of enclosing call levels kept.
-    Timeline(names, op, families, family, start, end, stream, call, origin)
+        enclose launches; the number of outermost enclosing call levels kept as ids, and of innermost ones kept as
+        names (the call site); the names of synchronizing host calls.
+    Sync(thread, start, end, name, site)
+        One synchronizing host call: its thread, start and end in microseconds, name and call site (innermost CPU call
+        names first). Example: `f"{s.name} in {' < '.join(s.site)}"`.
+    Timeline(names, op, families, family, kind, start, end, stream, call, launch_start, launch_end, launch_thread,
+             launch_call, site, syncs, origin)
         names   list[str], the distinct operation names.
         op      int64 array, per operation the index of its name in `names`, in launch order.
         families list[str], the distinct name families.
@@ -25,8 +32,15 @@ Public components
         start   float64 array, per operation the GPU start time in microseconds.
         end     float64 array, per operation the GPU end time in microseconds.
         stream  int64 array, per operation the GPU stream.
+        kind    int64 array, per operation the index of its category in GPU_CATEGORIES (0 kernel, 1 copy, 2 set).
         call    int64 array (operations x CALL_DEPTH), per operation the ids of the enclosing CPU calls, outermost
                 first, -1 below the innermost one; two operations launched inside the same call share its id.
+        launch_start, launch_end, launch_thread
+                arrays, per operation the start and end (microseconds) and the thread of its launch call.
+        launch_call  list[str], per operation the name of its launch call.
+        site    list[tuple[str, ...]], per operation the names of the innermost SITE_DEPTH CPU calls around its launch,
+                innermost first.
+        syncs   list[Sync], the synchronizing host calls, ordered by thread and start.
         origin  float, the earliest timestamp of any event in the trace, in microseconds; reported times are relative
                 to it.
         Example: `tl.names[tl.op[0]]` is the name of the first GPU operation launched; `tl.call[k, 0] ==
@@ -48,6 +62,19 @@ GPU_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")
 LAUNCH_CATEGORIES = ("cuda_runtime", "cuda_driver")
 CALL_CATEGORIES = ("cpu_op", "user_annotation")
 CALL_DEPTH = 4
+SITE_DEPTH = 3
+SYNC_CALLS = ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize", "cudaMemcpy",
+              "cuStreamSynchronize", "cuCtxSynchronize", "cuEventSynchronize", "hipStreamSynchronize",
+              "hipDeviceSynchronize", "hipEventSynchronize", "hipMemcpy")
+
+
+@dataclass
+class Sync:
+    thread: int
+    start: float
+    end: float
+    name: str
+    site: tuple[str, ...]
 
 
 @dataclass
@@ -56,10 +83,17 @@ class Timeline:
     op: np.ndarray
     families: list[str]
     family: np.ndarray
+    kind: np.ndarray
     start: np.ndarray
     end: np.ndarray
     stream: np.ndarray
     call: np.ndarray
+    launch_start: np.ndarray
+    launch_end: np.ndarray
+    launch_thread: np.ndarray
+    launch_call: list[str]
+    site: list[tuple[str, ...]]
+    syncs: list[Sync]
     origin: float
 
 
@@ -76,15 +110,24 @@ def load(path: str) -> Timeline:
     start = np.array([e["ts"] for e in gpu], dtype=np.float64)
     end = start + np.array([e["dur"] for e in gpu], dtype=np.float64)
     stream = np.array([e["tid"] for e in gpu], dtype=np.int64)
-    call = _calls(events, [launch[e["args"]["correlation"]] for e in gpu])
+    kind = np.array([GPU_CATEGORIES.index(e["cat"]) for e in gpu], dtype=np.int64)
+    calls = [launch[e["args"]["correlation"]] for e in gpu]
+    call, site = _calls(events, calls)
+    sync = sorted((e for e in events if e.get("cat") in LAUNCH_CATEGORIES and e["name"] in SYNC_CALLS),
+                  key=lambda e: (e["tid"], e["ts"]))
+    syncs = [Sync(e["tid"], e["ts"], e["ts"] + e["dur"], e["name"], s) for e, s in zip(sync, _calls(events, sync)[1])]
     groups: dict[str, int] = {}
     of = np.array([groups.setdefault(re.sub(r"[0-9]+", "#", n), len(groups)) for n in index], dtype=np.int64)
-    return Timeline(list(index), op, list(groups), of[op], start, end, stream, call,
+    return Timeline(list(index), op, list(groups), of[op], kind, start, end, stream, call,
+                    np.array([c["ts"] for c in calls], dtype=np.float64),
+                    np.array([c["ts"] + c["dur"] for c in calls], dtype=np.float64),
+                    np.array([c["tid"] for c in calls], dtype=np.int64), [c["name"] for c in calls], site, syncs,
                     float(min(e["ts"] for e in events)))
 
 
-def _calls(events: list[dict], launches: list[dict]) -> np.ndarray:
-    """Per launch, the ids of the CPU calls enclosing it on its thread, outermost first."""
+def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[tuple[str, ...]]]:
+    """Per launch, the ids of the outermost CPU calls enclosing it on its thread, outermost first, and the names of
+    the innermost ones, innermost first."""
     calls = defaultdict(list)
     for k, e in enumerate(events):
         if e.get("cat") in CALL_CATEGORIES:
@@ -93,6 +136,7 @@ def _calls(events: list[dict], launches: list[dict]) -> np.ndarray:
     for i, e in enumerate(launches):
         order[e["tid"]].append((e["ts"], i))
     out = np.full((len(launches), CALL_DEPTH), -1, dtype=np.int64)
+    sites: list[tuple[str, ...]] = [()] * len(launches)
     for tid, todo in order.items():
         cpu = sorted(calls[tid])
         stack: list[tuple[float, int]] = []
@@ -107,4 +151,5 @@ def _calls(events: list[dict], launches: list[dict]) -> np.ndarray:
                 stack.pop()
             ids = [k for _, k in stack[:CALL_DEPTH]]
             out[i, :len(ids)] = ids
-    return out
+            sites[i] = tuple(events[k]["name"] for _, k in reversed(stack[-SITE_DEPTH:]))
+    return out, sites

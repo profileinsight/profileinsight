@@ -52,9 +52,10 @@ run of its own copies; smaller loops and runs stay inside the parts around them,
 at this zoom level either. Runs with the same loop symbol or the same template get the same letter.
 
 Public components
-    Segment(label, begin, end, ops, more, fewer, shape)
+    Segment(label, begin, end, first, last, ops, more, fewer, shape)
         One letter of the pattern. begin and end are lists of times in ms from the start of the trace, one entry per
-        repetition; ops lists the GPU operations per repetition; more and fewer list per repetition how many
+        repetition; first and last list per repetition the range [first, last) of its operations in the timeline's
+        launch order; ops lists the GPU operations per repetition; more and fewer list per repetition how many
         operations it has more and fewer than the reference (step d); shape describes the content of a reference
         repetition, e.g. "12 ops, (35 ops)^61, 40 ops". Property count is the number of repetitions.
         Example: `seg.count`, `max(seg.end) - min(seg.begin)` (time spanned by the whole run, in ms).
@@ -88,6 +89,8 @@ class Segment:
     label: str
     begin: list[float]
     end: list[float]
+    first: list[int]
+    last: list[int]
     ops: list[int]
     more: list[int]
     fewer: list[int]
@@ -191,6 +194,7 @@ def _segment(tl: Timeline, main: np.ndarray, label: str, reps: list[list[Item]])
     fewer = [sum((reference - c).values()) for c in content]
     times = [_window(tl, main, r[0].lo, r[-1].hi) for r in reps]
     return Segment(label, [(b - tl.origin) / 1e3 for b, _ in times], [(e - tl.origin) / 1e3 for _, e in times],
+                   [r[0].lo for r in reps], [r[-1].hi for r in reps],
                    [r[-1].hi - r[0].lo for r in reps], more, fewer, _shape(reps[content.index(reference)]))
 
 

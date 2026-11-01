@@ -14,12 +14,19 @@ pip install profileinsight
 ## Use
 
 ```
-profileinsight structure trace_rank0.json.gz
+profileinsight trace_rank0.json.gz
 ```
 
-prints the cycles of the GPU timeline, such as `Timeline structure: A B^8 C` for a setup part, eight repetitions and a
-tail, with the time of every repetition and how the repetitions differ from each other. The method is described at the
-top of `src/profileinsight/cycles.py`.
+prints the analysis report of the profile:
+
+1. the cycles of the GPU timeline, such as `Timeline structure: A B^8 C` for a setup part, eight repetitions and a
+   tail, with the time of every repetition and how the repetitions differ from each other
+   (`src/profileinsight/cycles.py`);
+2. the bubbles, the times when no compute kernel runs, with their reasons (communication, copies, a host
+   synchronization, a slow host, ...), summed per repetition, and an example timeline for communication and copy
+   bubbles (`src/profileinsight/bubbles.py`).
+
+The rules behind each part are described at the top of its file.
 
 ## Release
 
