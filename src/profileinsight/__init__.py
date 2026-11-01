@@ -1,6 +1,8 @@
 """ProfileInsight: find why a GPU job is slow from its profile.
 
-The package is in an early stage and holds no analysis yet; it exists so that the name and the release path are in place.
+The package reads PyTorch profiler traces and reports what a person would see first when reading them. Modules:
+timeline.py (the GPU timeline in program order), loops.py (exact loops), cycles.py (rule 1: the cycles of the
+timeline, e.g. A B^20 C^10 D) and cli.py (the `profileinsight` command).
 
 Public components
     __version__   str, the package version, kept equal to `version` in pyproject.toml.

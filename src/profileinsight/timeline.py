@@ -1,0 +1,110 @@
+"""The GPU timeline of a profile: every kernel, memory copy and memory set as one row, in program order.
+
+A PyTorch profiler (Kineto) trace is a Chrome trace JSON file, optionally gzip-compressed. Its GPU operations are the
+complete events ("ph": "X") of the categories in GPU_CATEGORIES. Each one carries a correlation id that links it to the
+host call that launched it (a runtime or driver event with the same id). Operations are ordered by the start time of
+that launch call, then by GPU start time (all kernels of one CUDA graph launch share the launch call). Launch order is
+the order of the program, so it repeats exactly from iteration to iteration, while GPU start order varies with the
+timing of concurrent streams. For every operation the timeline also keeps the CPU calls (CALL_CATEGORIES events on the
+launching thread) that enclosed its launch, outermost first, up to CALL_DEPTH levels: where these change, the program
+moves from one unit of work to the next. All analyses in this package read the timeline as a sequence of symbols: each
+operation is replaced by the index of its name, so that repeated work becomes repeated symbols. Each operation also
+has a family: its name with every run of digits replaced by "#", so that kernels that differ only in a number (a
+recompiled triton_poi_fused__to_copy_21 and _3, tile sizes in template arguments) count as the same kind of work when
+repetitions are compared.
+
+Public components
+    GPU_CATEGORIES, LAUNCH_CATEGORIES, CALL_CATEGORIES, CALL_DEPTH
+        The trace event categories of GPU operations, of the host calls that launch them and of the CPU calls that
+        enclose launches; the number of enclosing call levels kept.
+    Timeline(names, op, families, family, start, end, stream, call, origin)
+        names   list[str], the distinct operation names.
+        op      int64 array, per operation the index of its name in `names`, in launch order.
+        families list[str], the distinct name families.
+        family  int64 array, per operation the index of its family in `families`.
+        start   float64 array, per operation the GPU start time in microseconds.
+        end     float64 array, per operation the GPU end time in microseconds.
+        stream  int64 array, per operation the GPU stream.
+        call    int64 array (operations x CALL_DEPTH), per operation the ids of the enclosing CPU calls, outermost
+                first, -1 below the innermost one; two operations launched inside the same call share its id.
+        origin  float, the earliest timestamp of any event in the trace, in microseconds; reported times are relative
+                to it.
+        Example: `tl.names[tl.op[0]]` is the name of the first GPU operation launched; `tl.call[k, 0] ==
+        tl.call[k + 1, 0]` tells whether operations k and k + 1 were launched inside the same outermost CPU call.
+    load(path) -> Timeline
+        Reads a trace file (.json or .json.gz) and returns its GPU timeline. Fails if the trace has no GPU operation or
+        if an operation has no launch call.
+        Example: `tl = load("trace_rank0.json.gz"); print(len(tl.op), "GPU operations")`.
+"""
+import gzip
+import json
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+
+import numpy as np
+
+GPU_CATEGORIES = ("kernel", "gpu_memcpy", "gpu_memset")
+LAUNCH_CATEGORIES = ("cuda_runtime", "cuda_driver")
+CALL_CATEGORIES = ("cpu_op", "user_annotation")
+CALL_DEPTH = 4
+
+
+@dataclass
+class Timeline:
+    names: list[str]
+    op: np.ndarray
+    families: list[str]
+    family: np.ndarray
+    start: np.ndarray
+    end: np.ndarray
+    stream: np.ndarray
+    call: np.ndarray
+    origin: float
+
+
+def load(path: str) -> Timeline:
+    with (gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb")) as f:
+        events = [e for e in json.load(f)["traceEvents"] if e.get("ph") == "X"]
+    launch = {e["args"]["correlation"]: e for e in events
+              if e.get("cat") in LAUNCH_CATEGORIES and "correlation" in e.get("args", {})}
+    gpu = [e for e in events if e.get("cat") in GPU_CATEGORIES]
+    assert gpu, f"{path} has no GPU operations (categories {GPU_CATEGORIES})"
+    gpu.sort(key=lambda e: (launch[e["args"]["correlation"]]["ts"], e["ts"]))
+    index: dict[str, int] = {}
+    op = np.array([index.setdefault(e["name"], len(index)) for e in gpu], dtype=np.int64)
+    start = np.array([e["ts"] for e in gpu], dtype=np.float64)
+    end = start + np.array([e["dur"] for e in gpu], dtype=np.float64)
+    stream = np.array([e["tid"] for e in gpu], dtype=np.int64)
+    call = _calls(events, [launch[e["args"]["correlation"]] for e in gpu])
+    groups: dict[str, int] = {}
+    of = np.array([groups.setdefault(re.sub(r"[0-9]+", "#", n), len(groups)) for n in index], dtype=np.int64)
+    return Timeline(list(index), op, list(groups), of[op], start, end, stream, call,
+                    float(min(e["ts"] for e in events)))
+
+
+def _calls(events: list[dict], launches: list[dict]) -> np.ndarray:
+    """Per launch, the ids of the CPU calls enclosing it on its thread, outermost first."""
+    calls = defaultdict(list)
+    for k, e in enumerate(events):
+        if e.get("cat") in CALL_CATEGORIES:
+            calls[e["tid"]].append((e["ts"], -e["dur"], k))
+    order = defaultdict(list)
+    for i, e in enumerate(launches):
+        order[e["tid"]].append((e["ts"], i))
+    out = np.full((len(launches), CALL_DEPTH), -1, dtype=np.int64)
+    for tid, todo in order.items():
+        cpu = sorted(calls[tid])
+        stack: list[tuple[float, int]] = []
+        j = 0
+        for ts, i in sorted(todo):
+            while j < len(cpu) and cpu[j][0] <= ts:
+                while stack and stack[-1][0] < cpu[j][0]:
+                    stack.pop()
+                stack.append((cpu[j][0] - cpu[j][1], cpu[j][2]))
+                j += 1
+            while stack and stack[-1][0] < ts:
+                stack.pop()
+            ids = [k for _, k in stack[:CALL_DEPTH]]
+            out[i, :len(ids)] = ids
+    return out

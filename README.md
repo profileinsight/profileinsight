@@ -2,13 +2,24 @@
 
 Find why your GPU job is slow from its profile.
 
-ProfileInsight is in an early stage. The current release, 0.0.1, contains no analysis yet.
+ProfileInsight reads a PyTorch profiler trace (Chrome trace JSON, optionally gzip-compressed) and reports what a person
+would see first when reading it. It is in an early stage.
 
 ## Install
 
 ```
 pip install profileinsight
 ```
+
+## Use
+
+```
+profileinsight structure trace_rank0.json.gz
+```
+
+prints the cycles of the GPU timeline, such as `Timeline structure: A B^8 C` for a setup part, eight repetitions and a
+tail, with the time of every repetition and how the repetitions differ from each other. The method is described at the
+top of `src/profileinsight/cycles.py`.
 
 ## Release
 
