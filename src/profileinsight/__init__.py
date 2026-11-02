@@ -7,7 +7,7 @@ and cli.py (the `profileinsight` command).
 
 Public components
     __version__   str, the package version, kept equal to `version` in pyproject.toml.
-                  Example: `import profileinsight; print(profileinsight.__version__)` prints `0.0.2`.
+                  Example: `import profileinsight; print(profileinsight.__version__)` prints `0.0.3`.
 """
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"

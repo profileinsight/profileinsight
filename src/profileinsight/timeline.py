@@ -9,11 +9,11 @@ timing of concurrent streams. For every operation the timeline also keeps the CP
 launching thread) that enclosed its launch, outermost first, up to CALL_DEPTH levels: where these change, the program
 moves from one unit of work to the next; it also keeps the launch call itself and the innermost CPU calls around it (the
 call site). The host's synchronizing calls (SYNC_CALLS: stream, device and event synchronize, synchronous copies) are
-kept with their call sites, because a synchronize empties the GPU's queue of work. All analyses in this package read the timeline as a sequence of symbols: each
-operation is replaced by the index of its name, so that repeated work becomes repeated symbols. Each operation also
-has a family: its name with every run of digits replaced by "#", so that kernels that differ only in a number (a
-recompiled triton_poi_fused__to_copy_21 and _3, tile sizes in template arguments) count as the same kind of work when
-repetitions are compared.
+kept with their call sites, because a synchronize empties the GPU's queue of work. All analyses in this package read
+the timeline as a sequence of symbols: each operation is replaced by the index of its name, so that repeated work
+becomes repeated symbols. Each operation also has a family: its name with every run of digits replaced by "#", so that
+kernels that differ only in a number (a recompiled triton_poi_fused__to_copy_21 and _3, tile sizes in template
+arguments) count as the same kind of work when repetitions are compared.
 
 Public components
     GPU_CATEGORIES, LAUNCH_CATEGORIES, CALL_CATEGORIES, CALL_DEPTH, SITE_DEPTH, SYNC_CALLS
@@ -24,7 +24,7 @@ Public components
         One synchronizing host call: its thread, start and end in microseconds, name and call site (innermost CPU call
         names first). Example: `f"{s.name} in {' < '.join(s.site)}"`.
     Timeline(names, op, families, family, kind, start, end, stream, call, launch_start, launch_end, launch_thread,
-             launch_call, site, syncs, origin)
+             launch_call, site, syncs, bytes, origin)
         names   list[str], the distinct operation names.
         op      int64 array, per operation the index of its name in `names`, in launch order.
         families list[str], the distinct name families.
@@ -41,6 +41,7 @@ Public components
         site    list[tuple[str, ...]], per operation the names of the innermost SITE_DEPTH CPU calls around its launch,
                 innermost first.
         syncs   list[Sync], the synchronizing host calls, ordered by thread and start.
+        bytes   int64 array, per operation the bytes a copy or memory set moves (its "bytes" argument), 0 for a kernel.
         origin  float, the earliest timestamp of any event in the trace, in microseconds; reported times are relative
                 to it.
         Example: `tl.names[tl.op[0]]` is the name of the first GPU operation launched; `tl.call[k, 0] ==
@@ -94,6 +95,7 @@ class Timeline:
     launch_call: list[str]
     site: list[tuple[str, ...]]
     syncs: list[Sync]
+    bytes: np.ndarray
     origin: float
 
 
@@ -122,6 +124,7 @@ def load(path: str) -> Timeline:
                     np.array([c["ts"] for c in calls], dtype=np.float64),
                     np.array([c["ts"] + c["dur"] for c in calls], dtype=np.float64),
                     np.array([c["tid"] for c in calls], dtype=np.int64), [c["name"] for c in calls], site, syncs,
+                    np.array([e["args"]["bytes"] if k else 0 for e, k in zip(gpu, kind)], dtype=np.int64),
                     float(min(e["ts"] for e in events)))
 
 

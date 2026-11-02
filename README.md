@@ -23,8 +23,9 @@ prints the analysis report of the profile:
    tail, with the time of every repetition and how the repetitions differ from each other
    (`src/profileinsight/cycles.py`);
 2. the bubbles, the times when no compute kernel runs, with their reasons (communication, copies, a host
-   synchronization, a slow host, ...), summed per repetition, and an example timeline for communication and copy
-   bubbles (`src/profileinsight/bubbles.py`).
+   synchronization, a slow host, ...) taken from what the GPU actually waited for, summed per repetition, and an
+   example timeline for each listed group: for a copy or communication the awaited operation's size, rate, launch
+   time and the queue ahead of it, for a sync how long the host was blocked (`src/profileinsight/bubbles.py`).
 
 The rules behind each part are described at the top of its file.
 
