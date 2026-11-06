@@ -87,7 +87,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from profileinsight.cycles import Structure
-from profileinsight.timeline import Sync, Timeline
+from profileinsight.timeline import Sync, Timeline, short
 
 COMMUNICATION = re.compile(r"nccl|rccl|all_?reduce|all_?gather|reduce_?scatter|all_?to_?all|sendrecv|"
                            r"cross_device_reduce|deep_?ep", re.IGNORECASE)
@@ -288,7 +288,7 @@ def _view(tl: Timeline, bubble: Bubble, compute: np.ndarray) -> list[str]:
         what = f"host blocked in {s.name}" + (f" in {' < '.join(s.site)}" if s.site else "")
         events += [(s.start, 1, -2, what), (s.end, 0, -2, what)]
     for k in shown:
-        what = f"{_short(tl.names[tl.op[k]])} [stream {tl.stream[k]}]" + (" (awaited)" if k == w else "")
+        what = f"{short(tl.names[tl.op[k]])} [stream {tl.stream[k]}]" + (" (awaited)" if k == w else "")
         events += [(float(tl.start[k]), 1, k, what), (float(tl.end[k]), 0, k, what)]
     events.sort(key=lambda e: (e[0], e[1], e[2]))
     lane: dict[int, int] = {}
@@ -312,7 +312,7 @@ def _awaited(tl: Timeline, w: int) -> tuple[list[str], list[int]]:
     size = f", {tl.bytes[w] / 1e6:,.1f} MB at {tl.bytes[w] / dur / 1e3:,.1f} GB/s" if tl.bytes[w] else ""
     site = " < ".join(tl.site[w]) or "no CPU call"
     delay = (tl.start[w] - tl.launch_start[w]) / 1e3
-    lines = [f"awaited: {_short(tl.names[tl.op[w]])} [stream {tl.stream[w]}], {dur / 1e3:,.3f} ms{size}; "
+    lines = [f"awaited: {short(tl.names[tl.op[w]])} [stream {tl.stream[w]}], {dur / 1e3:,.3f} ms{size}; "
              f"launched at {ms(tl.launch_start[w])} from {site}, started {delay:,.3f} ms after its launch"]
     same = np.nonzero(tl.stream == tl.stream[w])[0]
     same = same[np.argsort(tl.start[same], kind="stable")]
@@ -366,7 +366,7 @@ def report(tl: Timeline, structure: Structure, bubbles: list[Bubble]) -> str:
                          f"{g.median / 1e3:,.3f} ms median, {g.total / 1e3:,.3f} ms total, "
                          f"ending typically {g.offset / 1e3:,.3f} ms into the repetition")
             name, _, waited = g.detail.partition("; ")
-            cause = _short(name) + (" in " + " < ".join(g.site) if g.site else "") + (f"; {waited}" if waited else "")
+            cause = short(name) + (" in " + " < ".join(g.site) if g.site else "") + (f"; {waited}" if waited else "")
             if cause:
                 lines.append(f"     {cause[:200]}")
             if g.reason in ("communication", "copy", "sync"):
@@ -381,13 +381,7 @@ def report(tl: Timeline, structure: Structure, bubbles: list[Bubble]) -> str:
     return "\n".join(lines).rstrip()
 
 
-def _short(name: str) -> str:
-    """A kernel name without "void", its parameter list and, when long, its template arguments."""
-    name = re.sub(r"^void ", "", name.replace("(anonymous namespace)", "anonymous").split("(")[0].strip())
-    shorter = re.sub(r"<[^<>]*>", "", name)
-    while len(name) > 80 and shorter != name:
-        name, shorter = shorter, re.sub(r"<[^<>]*>", "", shorter)
-    return name
+
 
 
 def _where(label: str, count: int, g: Group) -> str:

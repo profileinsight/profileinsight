@@ -24,7 +24,7 @@ Public components
         One synchronizing host call: its thread, start and end in microseconds, name and call site (innermost CPU call
         names first). Example: `f"{s.name} in {' < '.join(s.site)}"`.
     Timeline(names, op, families, family, kind, start, end, stream, call, launch_start, launch_end, launch_thread,
-             launch_call, site, syncs, bytes, origin)
+             launch_call, site, syncs, bytes, blocks_per_sm, occupancy, registers, dims, unlaunched, origin)
         names   list[str], the distinct operation names.
         op      int64 array, per operation the index of its name in `names`, in launch order.
         families list[str], the distinct name families.
@@ -42,13 +42,24 @@ Public components
                 innermost first.
         syncs   list[Sync], the synchronizing host calls, ordered by thread and start.
         bytes   int64 array, per operation the bytes a copy or memory set moves (its "bytes" argument), 0 for a kernel.
+        blocks_per_sm, occupancy, registers
+                arrays, per kernel the thread blocks of its grid per SM, its estimated achieved occupancy in percent and
+                its registers per thread (the kernel event's "blocks per SM", "est. achieved occupancy %" and
+                "registers per thread"); NaN (-1 for registers) for copies, sets and traces without them.
+        unlaunched  int, the GPU operations left out because their launch call is not in the trace.
+        dims    list, per operation the "Input Dims" of the innermost CPU call around its launch (present when the
+                profile was recorded with record_shapes=True), else None.
         origin  float, the earliest timestamp of any event in the trace, in microseconds; reported times are relative
                 to it.
         Example: `tl.names[tl.op[0]]` is the name of the first GPU operation launched; `tl.call[k, 0] ==
         tl.call[k + 1, 0]` tells whether operations k and k + 1 were launched inside the same outermost CPU call.
+    short(name) -> str
+        A kernel name without "void", its parameter list and, when long, its template arguments.
+        Example: `short("void cutlass::Kernel<...>(Params)")` is "cutlass::Kernel".
     load(path) -> Timeline
-        Reads a trace file (.json or .json.gz) and returns its GPU timeline. Fails if the trace has no GPU operation or
-        if an operation has no launch call.
+        Reads a trace file (.json or .json.gz) and returns its GPU timeline. GPU operations whose launch call is not in
+        the trace are left out: when the host runs ahead of the GPU, the work at the start of the recorded window was
+        launched before it (their number is in `unlaunched`). Fails if no GPU operation is left.
         Example: `tl = load("trace_rank0.json.gz"); print(len(tl.op), "GPU operations")`.
 """
 import gzip
@@ -96,6 +107,11 @@ class Timeline:
     site: list[tuple[str, ...]]
     syncs: list[Sync]
     bytes: np.ndarray
+    blocks_per_sm: np.ndarray
+    occupancy: np.ndarray
+    registers: np.ndarray
+    dims: list
+    unlaunched: int
     origin: float
 
 
@@ -104,8 +120,9 @@ def load(path: str) -> Timeline:
         events = [e for e in json.load(f)["traceEvents"] if e.get("ph") == "X"]
     launch = {e["args"]["correlation"]: e for e in events
               if e.get("cat") in LAUNCH_CATEGORIES and "correlation" in e.get("args", {})}
-    gpu = [e for e in events if e.get("cat") in GPU_CATEGORIES]
-    assert gpu, f"{path} has no GPU operations (categories {GPU_CATEGORIES})"
+    every = [e for e in events if e.get("cat") in GPU_CATEGORIES]
+    gpu = [e for e in every if e["args"]["correlation"] in launch]
+    assert gpu, f"{path} has no GPU operations with a launch call (categories {GPU_CATEGORIES})"
     gpu.sort(key=lambda e: (launch[e["args"]["correlation"]]["ts"], e["ts"]))
     index: dict[str, int] = {}
     op = np.array([index.setdefault(e["name"], len(index)) for e in gpu], dtype=np.int64)
@@ -114,10 +131,11 @@ def load(path: str) -> Timeline:
     stream = np.array([e["tid"] for e in gpu], dtype=np.int64)
     kind = np.array([GPU_CATEGORIES.index(e["cat"]) for e in gpu], dtype=np.int64)
     calls = [launch[e["args"]["correlation"]] for e in gpu]
-    call, site = _calls(events, calls)
+    call, site, inner = _calls(events, calls)
     sync = sorted((e for e in events if e.get("cat") in LAUNCH_CATEGORIES and e["name"] in SYNC_CALLS),
                   key=lambda e: (e["tid"], e["ts"]))
     syncs = [Sync(e["tid"], e["ts"], e["ts"] + e["dur"], e["name"], s) for e, s in zip(sync, _calls(events, sync)[1])]
+    arg = lambda key, empty: np.array([e["args"].get(key, empty) for e in gpu], dtype=np.float64)
     groups: dict[str, int] = {}
     of = np.array([groups.setdefault(re.sub(r"[0-9]+", "#", n), len(groups)) for n in index], dtype=np.int64)
     return Timeline(list(index), op, list(groups), of[op], kind, start, end, stream, call,
@@ -125,12 +143,15 @@ def load(path: str) -> Timeline:
                     np.array([c["ts"] + c["dur"] for c in calls], dtype=np.float64),
                     np.array([c["tid"] for c in calls], dtype=np.int64), [c["name"] for c in calls], site, syncs,
                     np.array([e["args"]["bytes"] if k else 0 for e, k in zip(gpu, kind)], dtype=np.int64),
+                    arg("blocks per SM", np.nan), arg("est. achieved occupancy %", np.nan),
+                    arg("registers per thread", -1).astype(np.int64),
+                    [events[k]["args"].get("Input Dims") if k >= 0 else None for k in inner], len(every) - len(gpu),
                     float(min(e["ts"] for e in events)))
 
 
-def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[tuple[str, ...]]]:
-    """Per launch, the ids of the outermost CPU calls enclosing it on its thread, outermost first, and the names of
-    the innermost ones, innermost first."""
+def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[tuple[str, ...]], list[int]]:
+    """Per launch, the ids of the outermost CPU calls enclosing it on its thread, outermost first, the names of the
+    innermost ones, innermost first, and the event index of the innermost one (-1 if none)."""
     calls = defaultdict(list)
     for k, e in enumerate(events):
         if e.get("cat") in CALL_CATEGORIES:
@@ -140,6 +161,7 @@ def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[t
         order[e["tid"]].append((e["ts"], i))
     out = np.full((len(launches), CALL_DEPTH), -1, dtype=np.int64)
     sites: list[tuple[str, ...]] = [()] * len(launches)
+    inner = [-1] * len(launches)
     for tid, todo in order.items():
         cpu = sorted(calls[tid])
         stack: list[tuple[float, int]] = []
@@ -155,4 +177,14 @@ def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[t
             ids = [k for _, k in stack[:CALL_DEPTH]]
             out[i, :len(ids)] = ids
             sites[i] = tuple(events[k]["name"] for _, k in reversed(stack[-SITE_DEPTH:]))
-    return out, sites
+            inner[i] = stack[-1][1] if stack else -1
+    return out, sites, inner
+
+
+def short(name: str) -> str:
+    """A kernel name without "void", its parameter list and, when long, its template arguments."""
+    name = re.sub(r"^void ", "", name.replace("(anonymous namespace)", "anonymous").split("(")[0].strip())
+    shorter = re.sub(r"<[^<>]*>", "", name)
+    while len(name) > 80 and shorter != name:
+        name, shorter = shorter, re.sub(r"<[^<>]*>", "", shorter)
+    return name
