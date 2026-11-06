@@ -23,8 +23,11 @@ Public components
     Sync(thread, start, end, name, site)
         One synchronizing host call: its thread, start and end in microseconds, name and call site (innermost CPU call
         names first). Example: `f"{s.name} in {' < '.join(s.site)}"`.
+    DTYPE_BYTES
+        The size in bytes of the element types that collectives report.
     Timeline(names, op, families, family, kind, start, end, stream, call, launch_start, launch_end, launch_thread,
-             launch_call, site, syncs, bytes, blocks_per_sm, occupancy, registers, dims, unlaunched, origin)
+             launch_call, site, syncs, bytes, blocks_per_sm, occupancy, registers, dims, comm_bytes, comm_ranks,
+             host_calls, unlaunched, origin)
         names   list[str], the distinct operation names.
         op      int64 array, per operation the index of its name in `names`, in launch order.
         families list[str], the distinct name families.
@@ -46,6 +49,12 @@ Public components
                 arrays, per kernel the thread blocks of its grid per SM, its estimated achieved occupancy in percent and
                 its registers per thread (the kernel event's "blocks per SM", "est. achieved occupancy %" and
                 "registers per thread"); NaN (-1 for registers) for copies, sets and traces without them.
+        comm_bytes, comm_ranks
+                int64 arrays, per operation launched inside a collective (an enclosing "record_param_comms" CPU event)
+                the bytes of its input message ("In msg nelems" times the size of its "dtype", 0 if the type is not in
+                DTYPE_BYTES) and the size of its process group; 0 for all other operations.
+        host_calls  dict[str, tuple[int, float]], per name of a host runtime or driver call (LAUNCH_CATEGORIES) its
+                count and total duration in microseconds over the trace, e.g. host_calls["cudaFree"].
         unlaunched  int, the GPU operations left out because their launch call is not in the trace.
         dims    list, per operation the "Input Dims" of the innermost CPU call around its launch (present when the
                 profile was recorded with record_shapes=True), else None.
@@ -75,6 +84,8 @@ LAUNCH_CATEGORIES = ("cuda_runtime", "cuda_driver")
 CALL_CATEGORIES = ("cpu_op", "user_annotation")
 CALL_DEPTH = 4
 SITE_DEPTH = 3
+DTYPE_BYTES = {"BFloat16": 2, "Half": 2, "Float": 4, "Double": 8, "Int": 4, "Long": 8, "Short": 2, "Byte": 1,
+               "Char": 1, "Bool": 1, "Float8_e4m3fn": 1, "Float8_e5m2": 1}
 SYNC_CALLS = ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize", "cudaMemcpy",
               "cuStreamSynchronize", "cuCtxSynchronize", "cuEventSynchronize", "hipStreamSynchronize",
               "hipDeviceSynchronize", "hipEventSynchronize", "hipMemcpy")
@@ -111,6 +122,9 @@ class Timeline:
     occupancy: np.ndarray
     registers: np.ndarray
     dims: list
+    comm_bytes: np.ndarray
+    comm_ranks: np.ndarray
+    host_calls: dict
     unlaunched: int
     origin: float
 
@@ -131,10 +145,16 @@ def load(path: str) -> Timeline:
     stream = np.array([e["tid"] for e in gpu], dtype=np.int64)
     kind = np.array([GPU_CATEGORIES.index(e["cat"]) for e in gpu], dtype=np.int64)
     calls = [launch[e["args"]["correlation"]] for e in gpu]
-    call, site, inner = _calls(events, calls)
+    call, site, inner, comm = _calls(events, calls)
     sync = sorted((e for e in events if e.get("cat") in LAUNCH_CATEGORIES and e["name"] in SYNC_CALLS),
                   key=lambda e: (e["tid"], e["ts"]))
     syncs = [Sync(e["tid"], e["ts"], e["ts"] + e["dur"], e["name"], s) for e, s in zip(sync, _calls(events, sync)[1])]
+    comm_args = [events[k]["args"] if k >= 0 else {} for k in comm]
+    host_calls: dict[str, tuple[int, float]] = {}
+    for e in events:
+        if e.get("cat") in LAUNCH_CATEGORIES:
+            n, t = host_calls.get(e["name"], (0, 0.0))
+            host_calls[e["name"]] = (n + 1, t + e["dur"])
     arg = lambda key, empty: np.array([e["args"].get(key, empty) for e in gpu], dtype=np.float64)
     groups: dict[str, int] = {}
     of = np.array([groups.setdefault(re.sub(r"[0-9]+", "#", n), len(groups)) for n in index], dtype=np.int64)
@@ -145,13 +165,18 @@ def load(path: str) -> Timeline:
                     np.array([e["args"]["bytes"] if k else 0 for e, k in zip(gpu, kind)], dtype=np.int64),
                     arg("blocks per SM", np.nan), arg("est. achieved occupancy %", np.nan),
                     arg("registers per thread", -1).astype(np.int64),
-                    [events[k]["args"].get("Input Dims") if k >= 0 else None for k in inner], len(every) - len(gpu),
+                    [events[k]["args"].get("Input Dims") if k >= 0 else None for k in inner],
+                    np.array([a.get("In msg nelems", 0) * DTYPE_BYTES.get(a.get("dtype"), 0) for a in comm_args],
+                             dtype=np.int64),
+                    np.array([a.get("Group size", 0) for a in comm_args], dtype=np.int64), host_calls,
+                    len(every) - len(gpu),
                     float(min(e["ts"] for e in events)))
 
 
-def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[tuple[str, ...]], list[int]]:
+def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[tuple[str, ...]], list[int], list[int]]:
     """Per launch, the ids of the outermost CPU calls enclosing it on its thread, outermost first, the names of the
-    innermost ones, innermost first, and the event index of the innermost one (-1 if none)."""
+    innermost ones, innermost first, the event index of the innermost one and that of the innermost enclosing
+    "record_param_comms" (-1 if none)."""
     calls = defaultdict(list)
     for k, e in enumerate(events):
         if e.get("cat") in CALL_CATEGORIES:
@@ -162,6 +187,7 @@ def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[t
     out = np.full((len(launches), CALL_DEPTH), -1, dtype=np.int64)
     sites: list[tuple[str, ...]] = [()] * len(launches)
     inner = [-1] * len(launches)
+    comm = [-1] * len(launches)
     for tid, todo in order.items():
         cpu = sorted(calls[tid])
         stack: list[tuple[float, int]] = []
@@ -178,7 +204,8 @@ def _calls(events: list[dict], launches: list[dict]) -> tuple[np.ndarray, list[t
             out[i, :len(ids)] = ids
             sites[i] = tuple(events[k]["name"] for _, k in reversed(stack[-SITE_DEPTH:]))
             inner[i] = stack[-1][1] if stack else -1
-    return out, sites, inner
+            comm[i] = next((k for _, k in reversed(stack) if events[k]["name"] == "record_param_comms"), -1)
+    return out, sites, inner, comm
 
 
 def short(name: str) -> str:

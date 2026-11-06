@@ -18,7 +18,9 @@ profileinsight trace_rank0.json.gz
 profileinsight trace_rank0.json.gz trace_rank1.json.gz trace_rank2.json.gz trace_rank3.json.gz
 ```
 
-prints the analysis report of the profile (the first one, when several are given):
+prints the analysis report of the profile (the first one, when several are given). It opens with a verdict: the few
+findings that matter most, one line each with its evidence and, for a sign of misconfiguration, the setting to check.
+The parts follow:
 
 1. the cycles of the GPU timeline, such as `Timeline structure: A B^8 C` for a setup part, eight repetitions and a
    tail, with the time of every repetition and how the repetitions differ from each other
@@ -31,7 +33,10 @@ prints the analysis report of the profile (the first one, when several are given
    underfilled or pageable work (`src/profileinsight/busy.py`);
 4. given the profiles of several ranks of one job: which rank the others wait for at the collectives, how long, and
    the extra work that rank did before them (`src/profileinsight/ranks.py`). A single rank's profile cannot tell slow
-   communication from a late peer.
+   communication from a late peer;
+5. signs of common misconfigurations, recognised from the trace alone: attention on the math fallback, autograd anomaly
+   detection, driver allocations every step (caching allocator off or emptied), collectives on a slow transport, and
+   hooks on modules (`src/profileinsight/signs.py`).
 
 The rules behind each part are described at the top of its file.
 

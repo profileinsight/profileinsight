@@ -43,6 +43,11 @@ Public components
     report(timelines, ranks) -> str
         The text report: one line per rank, then, for the rank the others waited for most, its extra work.
         Example: `print(report(tls, compare(tls, paths)))`.
+    held_share(ranks) -> float
+        The largest time the other ranks wait for one rank alone, as a share of the span.
+    headline(timelines, ranks) -> str
+        One sentence for the report's verdict: the rank the others wait for, how long, and whether its host launches
+        late or its GPU runs extra work (with the largest extra kind); empty if no rank holds the others up.
 """
 import re
 from collections import defaultdict
@@ -113,8 +118,28 @@ def report(tls: list[Timeline], r: Ranks) -> str:
     return "\n".join(lines)
 
 
-def _extra(tls: list[Timeline], r: Ranks, late: int) -> list[str]:
-    """What the late rank did before the collectives it was late for, beyond the median of the other ranks."""
+def held_share(r: Ranks) -> float:
+    return max(r.held[r.last == k].sum() for k in range(len(r.names))) / r.span
+
+
+def headline(tls: list[Timeline], r: Ranks) -> str:
+    held = np.array([r.held[r.last == k].sum() for k in range(len(r.names))])
+    late = int(held.argmax())
+    if held[late] < LATE_SHARE * r.span:
+        return ""
+    late_at, extra, total, more_idle = _extra_work(tls, r, late)
+    why = (f"its host launches late (its GPU idles {more_idle / 1e3:,.1f} ms more than the others' before the "
+           f"collectives it is late for)" if more_idle > total else
+           f"it runs {total / 1e3:,.1f} ms more GPU work before them" +
+           (f", mostly {short(extra[0][2][0])} in {extra[0][2][1]}" if extra else ""))
+    return (f"{r.names[late]} holds the other ranks up at the collectives: they wait {held[late] / 1e3:,.1f} ms for "
+            f"it alone ({100 * held[late] / r.span:.0f}% of the span); {why}. The collectives are slow because they "
+            f"wait for it")
+
+
+def _extra_work(tls: list[Timeline], r: Ranks, late: int) -> tuple[list[int], list, float, float]:
+    """The collectives the late rank was late for (after the first), its extra work before them beyond the median of
+    the other ranks (time, calls, (family, site)), largest first, its total, and how much more its GPU idled."""
     rows = [collectives(tl)[-len(r.collectives):] for tl in tls]
     sums = [defaultdict(lambda: np.zeros(2)) for _ in tls]
     idle = np.zeros(len(tls))
@@ -132,8 +157,12 @@ def _extra(tls: list[Timeline], r: Ranks, late: int) -> list[str]:
         if t - rest[0] > 0:
             extra.append((t - rest[0], calls - rest[1], key))
     extra.sort(reverse=True)
-    total = sum(e[0] for e in extra)
-    more_idle = idle[late] - np.median(idle[others])
+    return late_at, extra, sum(e[0] for e in extra), float(idle[late] - np.median(idle[others]))
+
+
+def _extra(tls: list[Timeline], r: Ranks, late: int) -> list[str]:
+    """What the late rank did before the collectives it was late for, beyond the median of the other ranks."""
+    late_at, extra, total, more_idle = _extra_work(tls, r, late)
     out = [f"  Between the collectives it was late for and the ones before (in program order; {len(late_at)} after the "
            f"first in common), {r.names[late]} ran {total / 1e3:,.3f} ms more GPU work than the median other rank, "
            f"and its GPU idled {more_idle / 1e3:+,.3f} ms more" +

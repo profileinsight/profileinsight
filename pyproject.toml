@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "profileinsight"
-version = "0.0.4"
+version = "0.0.5"
 description = "Find why your GPU job is slow from its profile."
 readme = "README.md"
 requires-python = ">=3.10"
